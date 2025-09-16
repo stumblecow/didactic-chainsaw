@@ -1,0 +1,277 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import glob
+import os
+import re
+
+# Set up the page
+st.set_page_config(page_title="CourseVibe Analyzer", page_icon="📊", layout="wide")
+st.title("📊 CourseVibe: Performance Trend Analyzer")
+
+# Initialize session state for data persistence
+if 'combined_data' not in st.session_state:
+    st.session_state.combined_data = None
+if 'pivot_data' not in st.session_state:
+    st.session_state.pivot_data = None
+
+# Sidebar for navigation
+st.sidebar.header("CourseVibe Controls")
+st.sidebar.info("Upload your monthly CSV files to analyze course performance trends.")
+
+# File upload section
+st.sidebar.subheader("1. Data Ingestion")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload monthly CSV files", 
+    type="csv", 
+    accept_multiple_files=True,
+    help="Select all monthly CSV files you want to analyze"
+)
+
+# Function to process uploaded files
+def process_files(uploaded_files):
+    all_data = []
+    
+    for uploaded_file in uploaded_files:
+        try:
+            # Extract month from filename - this is the "vibey" part
+            filename = uploaded_file.name
+            month_year_match = re.search(r'(\w+)(\d{4})', filename)
+            
+            if month_year_match:
+                month_str, year_str = month_year_match.groups()
+                month_num = datetime.strptime(month_str[:3], '%b').month
+                date_str = f"{year_str}-{month_num:02d}-01"
+            else:
+                # Fallback: use current date if pattern not matched
+                date_str = datetime.today().strftime('%Y-%m-01')
+                st.warning(f"Could not extract date from filename: {filename}. Using current month.")
+            
+            # Read the CSV file
+            df = pd.read_csv(uploaded_file)
+            
+            # Add month column
+            df['Month'] = date_str
+            
+            all_data.append(df)
+            
+        except Exception as e:
+            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+    
+    if all_data:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        
+        # Clean numeric columns (remove commas, convert to numbers)
+        numeric_columns = ['Registrations', 'Completions', 'Time Spent(m)']
+        for col in numeric_columns:
+            if col in combined_df.columns:
+                combined_df[col] = pd.to_numeric(combined_df[col].astype(str).str.replace(',', ''), errors='coerce')
+        
+        return combined_df
+    return None
+
+# Process files when uploaded
+if uploaded_files:
+    with st.spinner("Processing your files..."):
+        st.session_state.combined_data = process_files(uploaded_files)
+    
+    if st.session_state.combined_data is not None:
+        st.sidebar.success(f"Processed {len(uploaded_files)} files with {len(st.session_state.combined_data)} total records!")
+        
+        # Show data preview
+        with st.expander("Preview Combined Data"):
+            st.dataframe(st.session_state.combined_data.head())
+else:
+    st.info("👈 Upload CSV files using the sidebar to get started")
+
+# Course selection and analysis
+if st.session_state.combined_data is not None:
+    st.sidebar.subheader("2. Course Selection")
+    
+    # Get unique courses
+    course_identifier = 'Name'  # Default to course name
+    if 'GCID' in st.session_state.combined_data.columns:
+        use_gcid = st.sidebar.checkbox("Use GCID instead of Course Name", value=False)
+        if use_gcid:
+            course_identifier = 'GCID'
+    
+    unique_courses = st.session_state.combined_data[course_identifier].unique()
+    selected_courses = st.sidebar.multiselect(
+        "Select courses to analyze",
+        options=unique_courses,
+        default=list(unique_courses[:min(5, len(unique_courses))])  # Default to first 5 courses
+    )
+    
+    # Metric selection
+    st.sidebar.subheader("3. Metric Selection")
+    available_metrics = []
+    for metric in ['Registrations', 'Completions', 'Time Spent(m)']:
+        if metric in st.session_state.combined_data.columns:
+            available_metrics.append(metric)
+    
+    selected_metric = st.sidebar.selectbox(
+        "Select metric to analyze",
+        options=available_metrics
+    )
+    
+    # Time conversion for Time Spent
+    if selected_metric == 'Time Spent(m)':
+        time_unit = st.sidebar.radio("Convert time to:", 
+                                    ["Minutes", "Hours", "Days"],
+                                    help="Convert time spent to more readable units")
+    
+    # Generate pivot table
+    if selected_courses:
+        filtered_data = st.session_state.combined_data[
+            st.session_state.combined_data[course_identifier].isin(selected_courses)
+        ]
+        
+        # Convert time if needed
+        if selected_metric == 'Time Spent(m)':
+            if time_unit == "Hours":
+                filtered_data['Time Spent(m)'] = filtered_data['Time Spent(m)'] / 60
+                selected_metric_display = "Time Spent(h)"
+            elif time_unit == "Days":
+                filtered_data['Time Spent(m)'] = filtered_data['Time Spent(m)'] / (60 * 8)  # Assuming 8-hour days
+                selected_metric_display = "Time Spent(days)"
+            else:
+                selected_metric_display = "Time Spent(m)"
+        else:
+            selected_metric_display = selected_metric
+        
+        # Create pivot table
+        pivot_df = pd.pivot_table(
+            filtered_data,
+            values=selected_metric,
+            index='Month',
+            columns=course_identifier,
+            aggfunc='sum',
+            fill_value=0
+        )
+        
+        # Sort by month
+        pivot_df.index = pd.to_datetime(pivot_df.index)
+        pivot_df = pivot_df.sort_index()
+        pivot_df.index = pivot_df.index.strftime('%Y-%m')
+        
+        st.session_state.pivot_data = pivot_df
+        
+        # Display results
+        st.header("Course Performance Analysis")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader(f"Trend: {selected_metric_display}")
+            
+            # Create plot
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for course in selected_courses:
+                if course in pivot_df.columns:
+                    ax.plot(pivot_df.index, pivot_df[course], marker='o', label=course)
+            
+            ax.set_xlabel('Month')
+            ax.set_ylabel(selected_metric_display)
+            ax.set_title(f'{selected_metric_display} Over Time')
+            plt.xticks(rotation=45)
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.tight_layout()
+            
+            st.pyplot(fig)
+            
+            # Export option
+            if st.button("Download Chart as PNG"):
+                fig.savefig("course_trends.png")
+                with open("course_trends.png", "rb") as file:
+                    st.download_button(
+                        label="Download PNG",
+                        data=file,
+                        file_name="course_trends.png",
+                        mime="image/png"
+                    )
+        
+        with col2:
+            st.subheader("Data Summary")
+            st.dataframe(pivot_df.style.format("{:,.0f}"))
+            
+            # Summary statistics
+            st.metric("Total Courses", len(selected_courses))
+            st.metric("Time Period", f"{len(pivot_df)} months")
+            
+            # Calculate total metric across all selected courses and time
+            total_value = pivot_df.sum().sum()
+            st.metric(f"Total {selected_metric_display}", f"{total_value:,.0f}")
+        
+        # Raw data section
+        with st.expander("View Raw Data"):
+            st.dataframe(filtered_data)
+            
+    else:
+        st.warning("Please select at least one course to analyze.")
+
+else:
+    # Placeholder before data is uploaded
+    st.markdown("""
+    ## Welcome to CourseVibe! 🎉
+    
+    This tool helps you analyze course performance trends over time without manual CSV merging.
+    
+    ### How to use:
+    1. **Upload CSV files** using the sidebar on the left
+    2. **Select courses** you want to analyze
+    3. **Choose a metric** to focus on (Registrations, Completions, or Time Spent)
+    4. **View and analyze** the trends in both chart and table format
+    
+    ### Supported data format:
+    Your CSV files should contain at least these columns:
+    - `Name` or `GCID` (course identifier)
+    - `Registrations` (numeric)
+    - `Completions` (numeric)
+    - `Time Spent(m)` (numeric, minutes)
+    
+    *Pro Tip:* Name your files with month and year (e.g., `January2023.csv`) for automatic date detection!
+    """)
+    
+    # Add some sample visualizations to demonstrate the tool
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Example Trend Visualization")
+        # Create sample data for demonstration
+        sample_months = ['2023-01', '2023-02', '2023-03', '2023-04', '2023-05']
+        sample_courses = {
+            'Data Science 101': [120, 145, 160, 190, 210],
+            'Web Dev Basics': [85, 92, 110, 125, 140],
+            'UX Design': [65, 75, 88, 95, 110]
+        }
+        
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for course, values in sample_courses.items():
+            ax.plot(sample_months, values, marker='o', label=course)
+        
+        ax.set_xlabel('Month')
+        ax.set_ylabel('Registrations')
+        ax.set_title('Example Course Trends')
+        plt.xticks(rotation=45)
+        ax.legend()
+        plt.tight_layout()
+        
+        st.pyplot(fig)
+    
+    with col2:
+        st.subheader("Example Data Summary")
+        sample_data = {
+            'Month': sample_months,
+            'Data Science 101': [120, 145, 160, 190, 210],
+            'Web Dev Basics': [85, 92, 110, 125, 140],
+            'UX Design': [65, 75, 88, 95, 110]
+        }
+        sample_df = pd.DataFrame(sample_data).set_index('Month')
+        st.dataframe(sample_df.style.format("{:,.0f}"))
+
+# Footer
+st.markdown("---")
+st.caption("CourseVibe v1.0 - Built for Content Producer Corey with ❤️")
